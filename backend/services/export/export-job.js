@@ -179,6 +179,17 @@ export async function uploadExportToDrive(exportId, sourceVideo = null) {
 				console.log(JSON.stringify({ event: "export_drive_stored", exportId,
 					driveUploadedAt: uploadedAt, expiresAt: confirmation.expiresAt,
 					metrics: saved.metrics }));
+				// --- Memory checkpoint 3: after Drive upload finishes ---
+				// Captured right after the Google Drive upload stream finishes and the
+				// file is confirmed stored in Drive. Comparing this to checkpoint 2
+				// measures memory overhead from Drive streaming and network operations.
+				const memAfterDrive = process.memoryUsage();
+				console.log(JSON.stringify({
+					event: "export_mem_after_drive",
+					exportId,
+					rssMB: (memAfterDrive.rss / 1048576).toFixed(1),
+					heapUsedMB: (memAfterDrive.heapUsed / 1048576).toFixed(1),
+				}));
 				return;
 			} catch (error) { finalizationError = error; }
 		}
@@ -228,6 +239,19 @@ async function processExportJob(exportId) {
 
 		if (["CLOSED", "EXPIRED"].includes(exp.status)) return;
 		metrics = createExportMetrics(exp.createdAt);
+
+		// --- Memory checkpoint 1: before the export starts ---
+		// We log RSS (Resident Set Size) which is the total physical memory the
+		// Node process is using right now, including the V8 heap, native buffers,
+		// and shared libraries. On a 512 MB Render instance this tells us how much
+		// headroom is left before ffmpeg starts.
+		const memBefore = process.memoryUsage();
+		console.log(JSON.stringify({
+			event: "export_mem_before",
+			exportId,
+			rssMB: (memBefore.rss / 1048576).toFixed(1),
+			heapUsedMB: (memBefore.heapUsed / 1048576).toFixed(1),
+		}));
 
 		const video = await videos.getVideo(exp.videoId);
 
@@ -417,10 +441,74 @@ async function processExportJob(exportId) {
 			throw new Error("The source video dimensions could not be determined.");
 		}
 
+		// --- Step 4: 720p scale cap for re-encoded clips ---
+		// If the source is taller than 720 pixels we scale the re-encoded clip
+		// down to a maximum of 720 pixels in height while keeping the original
+		// aspect ratio. This saves a lot of encoding memory and time because x264
+		// allocates frame buffers proportional to width × height.
+		//
+		// Rules:
+		//  • Stream-copy (cropMode=original, H.264 source): no scaling, -c copy is
+		//    used and that path never touches pixel data.
+		//  • Re-encode with user-chosen dimensions: the user's dimensions are
+		//    respected UNLESS they exceed 720 px in height; then we cap to 720.
+		//  • We only scale DOWN, never up.
+		//
+		// Note: `exportWidth`/`exportHeight` are the values ffmpeg will target.
+		// We may reduce them here; the filename is then built with the capped size
+		// so the user can see the actual output dimensions.
+		const MAX_ENCODE_HEIGHT = 720;
+		const sourceH = Number(sourceVideoStream.height) || 0;
+		// Stream-copy does not re-encode, so scaling has no effect there.
+		// We detect "will likely stream-copy" by checking cropMode=original here;
+		// the actual decision is made inside exportClip. If stream-copy is chosen
+		// the width/height we pass in are ignored, so it is safe to pass the
+		// (possibly capped) values regardless.
+		const willLikelyReencode = exp.cropMode !== "original" || !(
+			sourceVideoStream.codec_name === "h264" &&
+			sourceVideoStream.pix_fmt === "yuv420p"
+		);
+		let scaledWidth = exportWidth;
+		let scaledHeight = exportHeight;
+		if (willLikelyReencode && sourceH > MAX_ENCODE_HEIGHT && exportHeight > MAX_ENCODE_HEIGHT) {
+			// Cap height to 720 and derive width from the original aspect ratio,
+			// then round up to an even number (yuv420p requires even dimensions).
+			scaledHeight = MAX_ENCODE_HEIGHT;
+			scaledWidth = Math.round((exportWidth / exportHeight) * MAX_ENCODE_HEIGHT);
+			if (scaledWidth % 2 !== 0) scaledWidth += 1;
+			console.log(JSON.stringify({
+				event: "export_scale_cap",
+				exportId,
+				originalW: exportWidth, originalH: exportHeight,
+				scaledW: scaledWidth, scaledH: scaledHeight,
+				sourceH, reason: "source_exceeds_720p",
+			}));
+		}
+
+		// --- Step 8: pre-encode source info log ---
+		// Log the source resolution, size, and the encoding decision so we can
+		// diagnose memory problems without adding UI warnings yet.
+		{
+			const sourceStreamMeta = streams.metadata || {};
+			console.log(JSON.stringify({
+				event: "export_pre_encode",
+				exportId,
+				cropMode: exp.cropMode,
+				quality: exp.quality,
+				sourceW: sourceVideoStream.width,
+				sourceH: sourceVideoStream.height,
+				sourceDurationS: sourceStreamMeta.duration,
+				sourceBitrate: sourceStreamMeta.bitrate,
+				exportW: scaledWidth,
+				exportH: scaledHeight,
+				scaleCapped: scaledHeight !== exportHeight,
+			}));
+		}
+
 		const filename = buildExportFilename(
 			exp.filenameBase || video.title || "clip",
-			exportWidth,
-			exportHeight,
+			scaledWidth,
+			scaledHeight,
 		);
 
 		outputPath = path.join(
@@ -438,8 +526,11 @@ async function processExportJob(exportId) {
 			outputPath,
 			start: exportStart,
 			end: exportEnd,
-			width: exportWidth,
-			height: exportHeight,
+			// Use scaledWidth/scaledHeight (may be capped to 720p for re-encodes
+			// of tall sources). For stream-copy these values are passed through
+			// but ignored because -c copy bypasses all pixel processing.
+			width: scaledWidth,
+			height: scaledHeight,
 			quality: exp.quality,
 			cropMode: exp.cropMode || "fill",
 			captionsSrtPath,
@@ -501,8 +592,11 @@ async function processExportJob(exportId) {
 		if (outputMetadata.videoCodec !== "h264" || !(outputMetadata.duration > 0)
 			|| Math.abs(outputMetadata.duration - clipDuration) > durationTolerance
 			|| (streams.hasAudio && outputMetadata.audioCodec !== "aac")
-			|| (exp.cropMode !== "original" && (outputMetadata.width !== exportWidth
-				|| outputMetadata.height !== exportHeight))) {
+			// Validate against scaledWidth/scaledHeight (the dimensions we actually
+			// asked ffmpeg to produce), not the original exportWidth/exportHeight which
+			// may have been capped by the 720p scale rule above.
+			|| (exp.cropMode !== "original" && (outputMetadata.width !== scaledWidth
+				|| outputMetadata.height !== scaledHeight))) {
 			throw new Error("The completed export failed duration, codec or dimension validation.");
 		}
 
@@ -514,6 +608,20 @@ async function processExportJob(exportId) {
 		}
 
 		const localReadyAt = Date.now();
+
+		// --- Memory checkpoint 2: after ffmpeg finishes ---
+		// Captured right after the encode() promise resolves. At this point the
+		// ffmpeg child process has exited, so RSS should be falling (V8 GC hasn't
+		// necessarily collected yet, but the native ffmpeg buffers are gone).
+		const memAfterFfmpeg = process.memoryUsage();
+		console.log(JSON.stringify({
+			event: "export_mem_after_ffmpeg",
+			exportId,
+			rssMB: (memAfterFfmpeg.rss / 1048576).toFixed(1),
+			heapUsedMB: (memAfterFfmpeg.heapUsed / 1048576).toFixed(1),
+			ffmpegMs: metrics.timings.ffmpegMs,
+		}));
+
 		metrics.timings.localOutputPreparationMs = Math.max(0,
 			performance.now() - preparationStartedAt -
 			(metrics.timings.ffprobeMs - probesBeforePreparation),
@@ -535,7 +643,9 @@ async function processExportJob(exportId) {
 			clipStart: exp.start,
 			clipEnd: exp.end,
 			formatPreset: exp.cropMode === "original" ? "original" : exp.formatPreset,
-			encoderThreads: "auto",
+			// Updated: re-encodes now run with -threads 1 to cap memory on Render.
+			// Stream-copy uses no encoder threads.
+			encoderThreads: encodingDecision?.copyVideo ? 0 : 1,
 			concurrentFfmpegJobs: Math.max(0, ...metrics.resources.map(
 				(value) => Number(value.concurrentFfmpegJobsAtStart) || 0,
 			)),
@@ -551,8 +661,9 @@ async function processExportJob(exportId) {
 			outputPath,
 			filename,
 			error: null,
-			width: exportWidth,
-			height: exportHeight,
+			// Store the actual output dimensions (after the 720p scale cap).
+			width: scaledWidth,
+			height: scaledHeight,
 			metrics: measuredMetrics,
 		}, { allowedStatuses: ["PROCESSING"] });
 		if (!ready) return;
@@ -572,7 +683,8 @@ async function processExportJob(exportId) {
 	} catch (error) {
 		renderingComplete = true;
 		await progressWrite;
-		console.error(`Export ${exportId} failed:`, safeExportError(error));
+		const rawError = safeExportError(error);
+		console.error(`Export ${exportId} failed:`, rawError);
 
 		deleteExportWorkDir(exportId);
 
@@ -580,10 +692,18 @@ async function processExportJob(exportId) {
 			const currentExport = await store.getExport(exportId);
 
 			if (currentExport && !["CLOSED", "EXPIRED"].includes(currentExport.status)) {
+				// Detect memory exhaustion errors (OOM killer SIGKILL, ENOMEM, cannot allocate)
+				const isMemoryError =
+					/killed|sigkill|out of memory|enomem|cannot allocate memory/i.test(rawError);
+				// Friendly user-facing message for memory limit failures
+				const userMessage = isMemoryError
+					? "Export failed due to server memory limits on the free tier. Try choosing the fast stream-copy option (Original mode) or download the original video instead."
+					: rawError;
+
 				await store.patchExport(exportId, {
 					status: "ERROR",
 					progress: 0,
-					error: safeExportError(error),
+					error: userMessage,
 					metrics: metrics?.snapshot({ outcome: "failed" }) || {},
 				}, { allowedStatuses: ["QUEUED", "PROCESSING"] });
 			}
@@ -594,6 +714,12 @@ async function processExportJob(exportId) {
 			);
 		}
 	} finally {
+		// Clean up files created or downloaded strictly for this export job.
+		// These paths are located inside this export's isolated workDir, so deleting
+		// them will never touch other exports or videos.
+		deleteFile(temporaryVideoPath);
+		deleteFile(normalizedVideoPath);
+		deleteFile(fallbackSourcePath);
 		if (lockedSourcePath) releaseFileLock(lockedSourcePath);
 		releaseFileLock(processingLock);
 		const exp = await store.getExport(exportId).catch(() => null);

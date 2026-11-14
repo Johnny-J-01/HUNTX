@@ -22,6 +22,9 @@ RUN npm install
 # Copy all remaining backend files from context root
 COPY . ./
 
+# Limit Node heap memory to 200MB on 512MB Render free tier
+ENV NODE_OPTIONS="--max-old-space-size=200"
+
 # Expose port and start server
 EXPOSE 5000
 CMD ["npm", "start"]

@@ -21,6 +21,7 @@ export async function normalizeVideoSection(inputPath, outputPath, duration, onR
 		.audioCodec("aac")
 		.outputOptions([
 			"-threads 1", // Keep the separate YouTube normalization policy unchanged.
+			"-loglevel error",
 			"-map 0:v:0", "-map 0:a:0?", "-pix_fmt yuv420p",
 			"-preset ultrafast", "-crf 22", "-c:a aac", "-b:a 128k",
 			"-ar 48000", "-ac 2", "-start_at_zero",
@@ -34,8 +35,12 @@ export async function normalizeVideoSection(inputPath, outputPath, duration, onR
 export const QUALITY_PRESETS = {
 	low: { crf: 28, preset: "ultrafast", audioBitrate: "128k" },
 	medium: { crf: 25, preset: "ultrafast", audioBitrate: "128k" },
-	high: { crf: 22, preset: "superfast", audioBitrate: "160k" },
-	maximum: { crf: 20, preset: "superfast", audioBitrate: "192k" },
+	// Changed from "superfast" to "veryfast" for high and maximum quality presets.
+	// veryfast uses less internal x264 lookahead buffer memory than superfast while
+	// still producing good quality. ultrafast (used by low/medium) already uses the
+	// least memory and is left untouched.
+	high: { crf: 22, preset: "veryfast", audioBitrate: "160k" },
+	maximum: { crf: 20, preset: "veryfast", audioBitrate: "192k" },
 };
 
 function runCommand(command, outputPath, onProgress, onResources, sourceStreams) {
@@ -54,12 +59,26 @@ function runCommand(command, outputPath, onProgress, onResources, sourceStreams)
 	let started = false;
 	let finished = false;
 	let concurrencyAtStart = 0;
+	let ffmpegArgs = "";
+	let ffmpegExitCode = null;
+
 	return new Promise((resolve, reject) => {
 		async function finish(error) {
 			if (finished) return;
 			finished = true;
 			if (started) activeFfmpegJobs -= 1;
 			try {
+				// Keep only the last 2000 characters of ffmpeg error output to avoid
+				// buffering large strings in Node memory, and sanitize any credentials.
+				if (error) {
+					const rawMsg = String(error?.message || error || "");
+					const sanitizedMsg = rawMsg.replace(/Bearer\s+[^\s'"\\]+/gi, "Bearer [REDACTED]");
+					const shortTail = sanitizedMsg.length > 2000 ? sanitizedMsg.slice(-2000) : sanitizedMsg;
+					error = Object.assign(
+						new Error(shortTail),
+						{ code: ffmpegExitCode ?? error?.code },
+					);
+				}
 				const resources = await monitor.stop();
 				await onResources?.({ ...resources, concurrentFfmpegJobsAtStart: concurrencyAtStart });
 				if (error) reject(error);
@@ -69,15 +88,39 @@ function runCommand(command, outputPath, onProgress, onResources, sourceStreams)
 			}
 		}
 		command
-			.on("start", () => {
+			.on("start", (cmdLine) => {
 				started = true;
 				activeFfmpegJobs += 1;
 				concurrencyAtStart = activeFfmpegJobs;
-				monitor.attach(command.ffmpegProc);
-				monitor.start();
+				// Redact any Bearer tokens or secrets from the logged arguments
+				ffmpegArgs = String(cmdLine || "").replace(/Bearer\s+[^\s'"\\]+/gi, "Bearer [REDACTED]");
+				console.log(JSON.stringify({
+					event: "ffmpeg_spawned",
+					command: ffmpegArgs,
+				}));
+				if (command.ffmpegProc) {
+					command.ffmpegProc.on("exit", (code, signal) => {
+						ffmpegExitCode = code !== null ? code : (signal ? -1 : 0);
+					});
+					monitor.attach(command.ffmpegProc);
+					monitor.start();
+				}
 			})
-			.on("end", () => { void finish(); })
-			.on("error", (error) => { void finish(error); });
+			.on("end", () => {
+				console.log(JSON.stringify({
+					event: "ffmpeg_finished",
+					exitCode: ffmpegExitCode ?? 0,
+				}));
+				void finish();
+			})
+			.on("error", (error) => {
+				console.log(JSON.stringify({
+					event: "ffmpeg_failed",
+					exitCode: ffmpegExitCode ?? 1,
+					errorTail: String(error?.message || "").slice(-200),
+				}));
+				void finish(error);
+			});
 		if (onProgress) command.on("progress", (progress) => {
 			Promise.resolve().then(() => onProgress(Math.min(100, progress.percent || 0)))
 				.catch(() => {});
@@ -98,6 +141,8 @@ function encodedAudioOptions(quality) {
 
 function commonOutputOptions() {
 	return [
+		// Quiet log level: suppress informational stderr output to minimize Node buffer usage.
+		"-loglevel error",
 		"-movflags +faststart",
 		"-avoid_negative_ts make_zero",
 		"-max_muxing_queue_size 1024",
@@ -147,9 +192,13 @@ export async function exportClip(options) {
 			...(copyPlan.copyAudio ? ["-c:a copy"] : encodedAudioOptions(q)),
 			...commonOutputOptions(),
 		];
+		// Pre-input seek: placing -ss BEFORE -i makes ffmpeg jump to the keyframe
+		// nearest to `start` without reading and decoding all preceding frames.
+		// For stream-copy this is especially important because there is no decode
+		// step to absorb the cost. The output duration is still controlled by
+		// setDuration(-t) so the clip length is correct.
 		const command = ffmpeg(sourcePath)
-			.inputOptions(inputOptions)
-			.setStartTime(start)
+			.inputOptions(["-ss", String(start), ...inputOptions])
 			.setDuration(duration)
 			.outputOptions(outputOptions)
 			.output(outputPath);
@@ -205,8 +254,13 @@ export async function exportClip(options) {
 	}
 
 	command
-		.inputOptions([...inputOptions, "-accurate_seek"])
-		.setStartTime(start)
+		// Pre-input seek: -ss placed BEFORE -i tells ffmpeg to seek to the nearest
+		// keyframe before `start` without decoding preceding frames. This saves both
+		// time and memory compared to post-input (accurate) seek for long files.
+		// The output duration is still controlled by setDuration(-t duration), so
+		// the clip length remains correct. We remove -accurate_seek because it is
+		// only meaningful when -ss appears after the input.
+		.inputOptions(["-ss", String(start), ...inputOptions])
 		.setDuration(duration)
 		.outputOptions([
 			"-map 0:a:0?",
@@ -214,6 +268,18 @@ export async function exportClip(options) {
 			`-crf ${q.crf}`,
 			`-preset ${q.preset}`,
 			"-pix_fmt yuv420p",
+			// Limit re-encoding to one thread so the process fits in 512 MB.
+			// FFmpeg's default is "auto" which can spawn as many threads as CPU
+			// cores; each x264 thread holds its own lookahead buffer and frame
+			// cache, which adds up quickly on a 512 MB Render instance.
+			"-threads 1",
+			// One filter-graph thread for the same reason.
+			"-filter_threads 1",
+			// Tell x264 explicitly: one thread and zero lookahead frames.
+			// rc-lookahead=0 stops x264 from buffering future frames to decide
+			// the current frame's quality. It trades a tiny bit of compression
+			// efficiency for a large memory saving.
+			"-x264-params rc-lookahead=0:threads=1",
 			...encodedAudioOptions(q),
 			"-start_at_zero",
 			...commonOutputOptions(),
