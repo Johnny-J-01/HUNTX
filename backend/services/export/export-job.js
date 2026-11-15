@@ -31,9 +31,9 @@ import {
 	getExportDeleteLockKey,
 } from "./export-files.js";
 
-const EXPORT_CONCURRENCY = Math.min(
-	4,
-	Math.max(1, Number.parseInt(process.env.EXPORT_CONCURRENCY || "2", 10) || 2),
+const MAX_CONCURRENT_EXPORTS = Math.max(
+	1,
+	Number.parseInt(process.env.MAX_CONCURRENT_EXPORTS || "1", 10) || 1,
 );
 const exportQueue = [];
 const pendingExportJobs = new Map();
@@ -45,7 +45,7 @@ export function getExportJobStats() {
 	return {
 		active: activeExportJobs,
 		queued: exportQueue.length,
-		limit: EXPORT_CONCURRENCY,
+		limit: MAX_CONCURRENT_EXPORTS,
 	};
 }
 
@@ -578,6 +578,19 @@ async function processExportJob(exportId) {
 
 		renderingComplete = true;
 		await progressWrite;
+
+		// --- Memory checkpoint 2: after ffmpeg finishes ---
+		// Captured right after the encode() promise resolves and progress writes complete,
+		// before validation or file inspection, so memory is logged even if validation fails.
+		const memAfterFfmpeg = process.memoryUsage();
+		console.log(JSON.stringify({
+			event: "export_mem_after_ffmpeg",
+			exportId,
+			rssMB: (memAfterFfmpeg.rss / 1048576).toFixed(1),
+			heapUsedMB: (memAfterFfmpeg.heapUsed / 1048576).toFixed(1),
+			ffmpegMs: metrics.timings.ffmpegMs,
+		}));
+
 		const preparationStartedAt = performance.now();
 		const probesBeforePreparation = metrics.timings.ffprobeMs;
 		if (!fs.existsSync(outputPath)) {
@@ -588,15 +601,65 @@ async function processExportJob(exportId) {
 		const outputMetadata = await metrics.measure("ffprobeMs",
 			() => ffmpegSvc.probeMetadata(outputPath),
 		);
+
 		const durationTolerance = Math.max(0.1, 2 / (Number(outputMetadata.frameRate) || 30));
-		if (outputMetadata.videoCodec !== "h264" || !(outputMetadata.duration > 0)
-			|| Math.abs(outputMetadata.duration - clipDuration) > durationTolerance
-			|| (streams.hasAudio && outputMetadata.audioCodec !== "aac")
-			// Validate against scaledWidth/scaledHeight (the dimensions we actually
-			// asked ffmpeg to produce), not the original exportWidth/exportHeight which
-			// may have been capped by the 720p scale rule above.
-			|| (exp.cropMode !== "original" && (outputMetadata.width !== scaledWidth
-				|| outputMetadata.height !== scaledHeight))) {
+		const durationDiff = Math.abs((Number(outputMetadata.duration) || 0) - clipDuration);
+
+		const isVideoCodecValid = outputMetadata.videoCodec === "h264";
+		const isDurationValid = (outputMetadata.duration > 0) && (durationDiff <= durationTolerance);
+		const isAudioCodecValid = !streams.hasAudio || outputMetadata.audioCodec === "aac";
+		const isDimensionsValid = exp.cropMode === "original" || (
+			outputMetadata.width === scaledWidth && outputMetadata.height === scaledHeight
+		);
+
+		const isValid = isVideoCodecValid && isDurationValid && isAudioCodecValid && isDimensionsValid;
+
+		if (!isValid) {
+			const failedChecks = [];
+			const details = {};
+
+			if (!isVideoCodecValid) {
+				failedChecks.push("videoCodec");
+				details.videoCodec = {
+					actual: outputMetadata.videoCodec,
+					expected: "h264",
+				};
+			}
+
+			if (!isDurationValid) {
+				failedChecks.push("duration");
+				details.duration = {
+					actual: outputMetadata.duration,
+					expected: clipDuration,
+					difference: durationDiff,
+					tolerance: durationTolerance,
+				};
+			}
+
+			if (!isAudioCodecValid) {
+				failedChecks.push("audioCodec");
+				details.audioCodec = {
+					actual: outputMetadata.audioCodec,
+					expected: "aac",
+				};
+			}
+
+			if (!isDimensionsValid) {
+				failedChecks.push("dimensions");
+				details.dimensions = {
+					actual: { width: outputMetadata.width, height: outputMetadata.height },
+					expected: { width: scaledWidth, height: scaledHeight },
+				};
+			}
+
+			console.log(JSON.stringify({
+				event: "export_validation_failed",
+				exportId,
+				cropMode: exp.cropMode,
+				failedChecks,
+				details,
+			}));
+
 			throw new Error("The completed export failed duration, codec or dimension validation.");
 		}
 
@@ -608,19 +671,6 @@ async function processExportJob(exportId) {
 		}
 
 		const localReadyAt = Date.now();
-
-		// --- Memory checkpoint 2: after ffmpeg finishes ---
-		// Captured right after the encode() promise resolves. At this point the
-		// ffmpeg child process has exited, so RSS should be falling (V8 GC hasn't
-		// necessarily collected yet, but the native ffmpeg buffers are gone).
-		const memAfterFfmpeg = process.memoryUsage();
-		console.log(JSON.stringify({
-			event: "export_mem_after_ffmpeg",
-			exportId,
-			rssMB: (memAfterFfmpeg.rss / 1048576).toFixed(1),
-			heapUsedMB: (memAfterFfmpeg.heapUsed / 1048576).toFixed(1),
-			ffmpegMs: metrics.timings.ffmpegMs,
-		}));
 
 		metrics.timings.localOutputPreparationMs = Math.max(0,
 			performance.now() - preparationStartedAt -
@@ -650,7 +700,7 @@ async function processExportJob(exportId) {
 				(value) => Number(value.concurrentFfmpegJobsAtStart) || 0,
 			)),
 			concurrentExportJobs: activeExportJobs,
-			concurrencyLimit: EXPORT_CONCURRENCY,
+			concurrencyLimit: MAX_CONCURRENT_EXPORTS,
 		});
 		const ready = await store.patchExport(exportId, {
 			status: "READY",
@@ -757,9 +807,14 @@ async function processExportJob(exportId) {
 }
 
 function drainExportQueue() {
-	while (activeExportJobs < EXPORT_CONCURRENCY && exportQueue.length > 0) {
+	while (activeExportJobs < MAX_CONCURRENT_EXPORTS && exportQueue.length > 0) {
 		const next = exportQueue.shift();
 		activeExportJobs += 1;
+
+		console.log(JSON.stringify({
+			event: "export_started",
+			exportId: next.exportId,
+		}));
 
 		void processExportJob(next.exportId)
 			.catch((error) => {
@@ -781,6 +836,15 @@ export function runExportJob(exportId) {
 		exportQueue.push({ exportId, resolve });
 	});
 	pendingExportJobs.set(exportId, promise);
+
+	if (activeExportJobs >= MAX_CONCURRENT_EXPORTS) {
+		console.log(JSON.stringify({
+			event: "export_waiting",
+			exportId,
+			waiting: exportQueue.length,
+		}));
+	}
+
 	drainExportQueue();
 	return promise;
 }
