@@ -31,9 +31,9 @@ import {
 	getExportDeleteLockKey,
 } from "./export-files.js";
 
-const EXPORT_CONCURRENCY = Math.min(
-	4,
-	Math.max(1, Number.parseInt(process.env.EXPORT_CONCURRENCY || "2", 10) || 2),
+const MAX_CONCURRENT_EXPORTS = Math.max(
+	1,
+	Number.parseInt(process.env.MAX_CONCURRENT_EXPORTS || "1", 10) || 1,
 );
 const exportQueue = [];
 const pendingExportJobs = new Map();
@@ -45,8 +45,14 @@ export function getExportJobStats() {
 	return {
 		active: activeExportJobs,
 		queued: exportQueue.length,
-		limit: EXPORT_CONCURRENCY,
+		limit: MAX_CONCURRENT_EXPORTS,
 	};
+}
+
+function isPathInsideDir(childPath, parentDir) {
+	if (!childPath || !parentDir) return false;
+	const relative = path.relative(parentDir, childPath);
+	return !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
 function sanitizeFilename(filename) {
@@ -163,8 +169,6 @@ export async function uploadExportToDrive(exportId, sourceVideo = null) {
 		};
 		store.rememberExportDriveConfirmation(exportId, confirmation);
 		pendingDriveConfirmations.add(exportId);
-
-		// Retrying metadata must never repeat the completed media upload or reset TTL.
 		let finalizationError;
 		for (let attempt = 0; attempt < 3; attempt += 1) {
 			try {
@@ -179,6 +183,13 @@ export async function uploadExportToDrive(exportId, sourceVideo = null) {
 				console.log(JSON.stringify({ event: "export_drive_stored", exportId,
 					driveUploadedAt: uploadedAt, expiresAt: confirmation.expiresAt,
 					metrics: saved.metrics }));
+				const memAfterDrive = process.memoryUsage();
+				console.log(JSON.stringify({
+					event: "export_mem_after_drive",
+					exportId,
+					rssMB: (memAfterDrive.rss / 1048576).toFixed(1),
+					heapUsedMB: (memAfterDrive.heapUsed / 1048576).toFixed(1),
+				}));
 				return;
 			} catch (error) { finalizationError = error; }
 		}
@@ -208,18 +219,19 @@ async function processExportJob(exportId) {
 	const processingLock = getExportProcessingLockKey(exportId);
 	if (isFileLocked(getExportDeleteLockKey(exportId))) return;
 	acquireFileLock(processingLock);
+	const workDir = getExportWorkDir(exportId);
 	let outputPath = null;
 	let captionsSrtPath = null;
 	let temporaryVideoPath = null;
 	let normalizedVideoPath = null;
 	let fallbackSourcePath = null;
+	let encodingDecision = null;
 	let metrics = null;
 	let lockedSourcePath = null;
 	let progressWrite = Promise.resolve();
 	let renderingComplete = false;
 
 	try {
-		const workDir = getExportWorkDir(exportId);
 		const exp = await store.getExport(exportId);
 
 		if (!exp) {
@@ -228,6 +240,14 @@ async function processExportJob(exportId) {
 
 		if (["CLOSED", "EXPIRED"].includes(exp.status)) return;
 		metrics = createExportMetrics(exp.createdAt);
+
+		const memBefore = process.memoryUsage();
+		console.log(JSON.stringify({
+			event: "export_mem_before",
+			exportId,
+			rssMB: (memBefore.rss / 1048576).toFixed(1),
+			heapUsedMB: (memBefore.heapUsed / 1048576).toFixed(1),
+		}));
 
 		const video = await videos.getVideo(exp.videoId);
 
@@ -254,7 +274,7 @@ async function processExportJob(exportId) {
 		let inputOptions = [];
 		let streams = null;
 		let sourceAccess = "local";
-		let encodingDecision = null;
+		encodingDecision = null;
 		let exportStart = exp.start;
 		let exportEnd = exp.end;
 		const probeSource = (source, options = []) => metrics.measure(
@@ -267,14 +287,12 @@ async function processExportJob(exportId) {
 
 		if (video.sourceType === "upload") {
 			try {
-			// Check if local file still exists
 			if (video.filePath && fs.existsSync(video.filePath)) {
 				sourcePath = video.filePath;
 				lockedSourcePath = sourcePath;
 				acquireFileLock(lockedSourcePath);
 				console.log(`Using existing local video for export ${exportId}: ${sourcePath}`);
 			} else if (video.driveFileId) {
-				// Try remote Google Drive reading first
 				try {
 					const authClient = getAuthenticatedClient();
 					const tokenResponse = await authClient?.getAccessToken?.();
@@ -289,7 +307,6 @@ async function processExportJob(exportId) {
 							"1",
 						];
 
-						// Probe once and reuse the result for copy decisions and telemetry.
 						streams = await probeSource(remoteUrl, remoteOptions);
 						sourcePath = remoteUrl;
 						inputOptions = remoteOptions;
@@ -303,7 +320,6 @@ async function processExportJob(exportId) {
 						`Direct remote Google Drive reading failed for export ${exportId}; falling back to scoped local download:`,
 						safeExportError(remoteError),
 					);
-					// Fallback: download original video into this export's isolated workDir ONLY
 					fallbackSourcePath = path.join(workDir, `${video.id}_source.mp4`);
 					sourcePath = await retrieve(video.driveFileId, fallbackSourcePath);
 					sourceAccess = "drive-local";
@@ -313,7 +329,6 @@ async function processExportJob(exportId) {
 			}
 
 			} finally {
-				// Include failed acquisition attempts, but not nested probe time.
 				metrics.timings.sourceRetrievalMs = Math.max(
 					0, performance.now() - retrievalStartedAt - metrics.timings.ffprobeMs,
 				);
@@ -417,10 +432,53 @@ async function processExportJob(exportId) {
 			throw new Error("The source video dimensions could not be determined.");
 		}
 
+		const willLikelyReencode = exp.cropMode !== "original" || !(
+			sourceVideoStream.codec_name === "h264" &&
+			sourceVideoStream.pix_fmt === "yuv420p"
+		);
+		let scaledWidth = exportWidth;
+		let scaledHeight = exportHeight;
+
+		const MAX_SHORTER_SIDE = 720;
+		const shorterSide = Math.min(exportWidth, exportHeight);
+
+		if (willLikelyReencode && shorterSide > MAX_SHORTER_SIDE) {
+			const scaleFactor = MAX_SHORTER_SIDE / shorterSide;
+			scaledWidth = Math.round(exportWidth * scaleFactor);
+			scaledHeight = Math.round(exportHeight * scaleFactor);
+			if (scaledWidth % 2 !== 0) scaledWidth += 1;
+			if (scaledHeight % 2 !== 0) scaledHeight += 1;
+
+			console.log(JSON.stringify({
+				event: "export_scale_cap",
+				exportId,
+				originalW: exportWidth, originalH: exportHeight,
+				scaledW: scaledWidth, scaledH: scaledHeight,
+				reason: "shorter_side_exceeds_720p",
+			}));
+		}
+
+		{
+			const sourceStreamMeta = streams.metadata || {};
+			console.log(JSON.stringify({
+				event: "export_pre_encode",
+				exportId,
+				cropMode: exp.cropMode,
+				quality: exp.quality,
+				sourceW: sourceVideoStream.width,
+				sourceH: sourceVideoStream.height,
+				sourceDurationS: sourceStreamMeta.duration,
+				sourceBitrate: sourceStreamMeta.bitrate,
+				exportW: scaledWidth,
+				exportH: scaledHeight,
+				scaleCapped: scaledHeight !== exportHeight,
+			}));
+		}
+
 		const filename = buildExportFilename(
 			exp.filenameBase || video.title || "clip",
-			exportWidth,
-			exportHeight,
+			scaledWidth,
+			scaledHeight,
 		);
 
 		outputPath = path.join(
@@ -438,8 +496,8 @@ async function processExportJob(exportId) {
 			outputPath,
 			start: exportStart,
 			end: exportEnd,
-			width: exportWidth,
-			height: exportHeight,
+			width: scaledWidth,
+			height: scaledHeight,
 			quality: exp.quality,
 			cropMode: exp.cropMode || "fill",
 			captionsSrtPath,
@@ -487,6 +545,16 @@ async function processExportJob(exportId) {
 
 		renderingComplete = true;
 		await progressWrite;
+
+		const memAfterFfmpeg = process.memoryUsage();
+		console.log(JSON.stringify({
+			event: "export_mem_after_ffmpeg",
+			exportId,
+			rssMB: (memAfterFfmpeg.rss / 1048576).toFixed(1),
+			heapUsedMB: (memAfterFfmpeg.heapUsed / 1048576).toFixed(1),
+			ffmpegMs: metrics.timings.ffmpegMs,
+		}));
+
 		const preparationStartedAt = performance.now();
 		const probesBeforePreparation = metrics.timings.ffprobeMs;
 		if (!fs.existsSync(outputPath)) {
@@ -497,12 +565,65 @@ async function processExportJob(exportId) {
 		const outputMetadata = await metrics.measure("ffprobeMs",
 			() => ffmpegSvc.probeMetadata(outputPath),
 		);
-		const durationTolerance = Math.max(0.1, 2 / (Number(outputMetadata.frameRate) || 30));
-		if (outputMetadata.videoCodec !== "h264" || !(outputMetadata.duration > 0)
-			|| Math.abs(outputMetadata.duration - clipDuration) > durationTolerance
-			|| (streams.hasAudio && outputMetadata.audioCodec !== "aac")
-			|| (exp.cropMode !== "original" && (outputMetadata.width !== exportWidth
-				|| outputMetadata.height !== exportHeight))) {
+
+		const durationTolerance = Math.max(0.25, 3 / (Number(outputMetadata.frameRate) || 30));
+		const durationDiff = Math.abs((Number(outputMetadata.duration) || 0) - clipDuration);
+
+		const isVideoCodecValid = outputMetadata.videoCodec === "h264";
+		const isDurationValid = (outputMetadata.duration > 0) && (durationDiff <= durationTolerance);
+		const isAudioCodecValid = !streams.hasAudio || outputMetadata.audioCodec === "aac";
+		const isDimensionsValid = exp.cropMode === "original" || (
+			outputMetadata.width === scaledWidth && outputMetadata.height === scaledHeight
+		);
+
+		const isValid = isVideoCodecValid && isDurationValid && isAudioCodecValid && isDimensionsValid;
+
+		if (!isValid) {
+			const failedChecks = [];
+			const details = {};
+
+			if (!isVideoCodecValid) {
+				failedChecks.push("videoCodec");
+				details.videoCodec = {
+					actual: outputMetadata.videoCodec,
+					expected: "h264",
+				};
+			}
+
+			if (!isDurationValid) {
+				failedChecks.push("duration");
+				details.duration = {
+					actual: outputMetadata.duration,
+					expected: clipDuration,
+					difference: durationDiff,
+					tolerance: durationTolerance,
+				};
+			}
+
+			if (!isAudioCodecValid) {
+				failedChecks.push("audioCodec");
+				details.audioCodec = {
+					actual: outputMetadata.audioCodec,
+					expected: "aac",
+				};
+			}
+
+			if (!isDimensionsValid) {
+				failedChecks.push("dimensions");
+				details.dimensions = {
+					actual: { width: outputMetadata.width, height: outputMetadata.height },
+					expected: { width: scaledWidth, height: scaledHeight },
+				};
+			}
+
+			console.log(JSON.stringify({
+				event: "export_validation_failed",
+				exportId,
+				cropMode: exp.cropMode,
+				failedChecks,
+				details,
+			}));
+
 			throw new Error("The completed export failed duration, codec or dimension validation.");
 		}
 
@@ -514,6 +635,7 @@ async function processExportJob(exportId) {
 		}
 
 		const localReadyAt = Date.now();
+
 		metrics.timings.localOutputPreparationMs = Math.max(0,
 			performance.now() - preparationStartedAt -
 			(metrics.timings.ffprobeMs - probesBeforePreparation),
@@ -535,12 +657,13 @@ async function processExportJob(exportId) {
 			clipStart: exp.start,
 			clipEnd: exp.end,
 			formatPreset: exp.cropMode === "original" ? "original" : exp.formatPreset,
-			encoderThreads: "auto",
+			// update: re-encodes now run with -threads 1 to cap memory on Render.
+			encoderThreads: encodingDecision?.copyVideo ? 0 : 1,
 			concurrentFfmpegJobs: Math.max(0, ...metrics.resources.map(
 				(value) => Number(value.concurrentFfmpegJobsAtStart) || 0,
 			)),
 			concurrentExportJobs: activeExportJobs,
-			concurrencyLimit: EXPORT_CONCURRENCY,
+			concurrencyLimit: MAX_CONCURRENT_EXPORTS,
 		});
 		const ready = await store.patchExport(exportId, {
 			status: "READY",
@@ -551,28 +674,28 @@ async function processExportJob(exportId) {
 			outputPath,
 			filename,
 			error: null,
-			width: exportWidth,
-			height: exportHeight,
+			width: scaledWidth,
+			height: scaledHeight,
 			metrics: measuredMetrics,
 		}, { allowedStatuses: ["PROCESSING"] });
 		if (!ready) return;
 		measuredMetrics.totalExportMs = Date.now() - Number(exp.createdAt ?? Date.now());
-		// READY is already published; telemetry failure cannot invalidate the file.
 		await store.patchExport(exportId, { metrics: measuredMetrics }).catch((error) => {
 			console.warn(`Could not persist export readiness timing: ${safeExportError(error)}`);
 		});
 
 		void uploadExportToDrive(exportId, video);
 
-		deleteFile(temporaryVideoPath);
-		deleteFile(normalizedVideoPath);
-		deleteFile(fallbackSourcePath);
+		if (temporaryVideoPath && isPathInsideDir(temporaryVideoPath, workDir)) deleteFile(temporaryVideoPath);
+		if (normalizedVideoPath && isPathInsideDir(normalizedVideoPath, workDir)) deleteFile(normalizedVideoPath);
+		if (fallbackSourcePath && isPathInsideDir(fallbackSourcePath, workDir)) deleteFile(fallbackSourcePath);
 
 		console.log(JSON.stringify({ event: "export_local_ready", exportId, metrics: measuredMetrics }));
 	} catch (error) {
 		renderingComplete = true;
 		await progressWrite;
-		console.error(`Export ${exportId} failed:`, safeExportError(error));
+		const rawError = safeExportError(error);
+		console.error(`Export ${exportId} failed:`, rawError);
 
 		deleteExportWorkDir(exportId);
 
@@ -580,10 +703,16 @@ async function processExportJob(exportId) {
 			const currentExport = await store.getExport(exportId);
 
 			if (currentExport && !["CLOSED", "EXPIRED"].includes(currentExport.status)) {
+				const isMemoryError =
+					/killed|sigkill|out of memory|enomem|cannot allocate memory/i.test(rawError);
+				const userMessage = isMemoryError
+					? "Export failed due to server memory limits on the free tier. Try choosing the fast stream-copy option (Original mode) or download the original video instead."
+					: rawError;
+
 				await store.patchExport(exportId, {
 					status: "ERROR",
 					progress: 0,
-					error: safeExportError(error),
+					error: userMessage,
 					metrics: metrics?.snapshot({ outcome: "failed" }) || {},
 				}, { allowedStatuses: ["QUEUED", "PROCESSING"] });
 			}
@@ -594,17 +723,53 @@ async function processExportJob(exportId) {
 			);
 		}
 	} finally {
-		if (lockedSourcePath) releaseFileLock(lockedSourcePath);
-		releaseFileLock(processingLock);
-		const exp = await store.getExport(exportId).catch(() => null);
-		if (exp && ["ERROR", "EXPIRED", "CLOSED"].includes(exp.status)) deleteExportWorkDir(exportId);
+		const safeDeleteInWorkDir = (filePath) => {
+			if (!filePath) return;
+			try {
+				if (isPathInsideDir(filePath, workDir)) {
+					deleteFile(filePath);
+				}
+			} catch (deleteError) {
+				console.warn(`Failed to clean up temporary file ${filePath}:`, safeExportError(deleteError));
+			}
+		};
+
+		safeDeleteInWorkDir(temporaryVideoPath);
+		safeDeleteInWorkDir(normalizedVideoPath);
+		safeDeleteInWorkDir(fallbackSourcePath);
+
+		try {
+			if (lockedSourcePath) releaseFileLock(lockedSourcePath);
+		} catch (lockError) {
+			console.warn(`Failed to release source file lock for ${exportId}:`, safeExportError(lockError));
+		}
+
+		try {
+			releaseFileLock(processingLock);
+		} catch (lockError) {
+			console.warn(`Failed to release processing lock for ${exportId}:`, safeExportError(lockError));
+		}
+
+		try {
+			const exp = await store.getExport(exportId).catch(() => null);
+			if (exp && ["ERROR", "EXPIRED", "CLOSED"].includes(exp.status)) {
+				deleteExportWorkDir(exportId);
+			}
+		} catch (cleanupError) {
+			console.warn(`Failed to clean up workdir for ${exportId}:`, safeExportError(cleanupError));
+		}
 	}
 }
 
 function drainExportQueue() {
-	while (activeExportJobs < EXPORT_CONCURRENCY && exportQueue.length > 0) {
+	while (activeExportJobs < MAX_CONCURRENT_EXPORTS && exportQueue.length > 0) {
 		const next = exportQueue.shift();
 		activeExportJobs += 1;
+
+		console.log(JSON.stringify({
+			event: "export_started",
+			exportId: next.exportId,
+		}));
 
 		void processExportJob(next.exportId)
 			.catch((error) => {
@@ -626,6 +791,15 @@ export function runExportJob(exportId) {
 		exportQueue.push({ exportId, resolve });
 	});
 	pendingExportJobs.set(exportId, promise);
+
+	if (activeExportJobs >= MAX_CONCURRENT_EXPORTS) {
+		console.log(JSON.stringify({
+			event: "export_waiting",
+			exportId,
+			waiting: exportQueue.length,
+		}));
+	}
+
 	drainExportQueue();
 	return promise;
 }

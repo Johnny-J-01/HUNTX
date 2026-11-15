@@ -37,9 +37,14 @@ export function createExportMetrics(createdAt) {
 	};
 }
 
+export function redactSecrets(text) {
+	if (!text) return "";
+	return String(text)
+		.replace(/Authorization:\s*[^\r\n"'\\]+/gi, "Authorization: [REDACTED]")
+		.replace(/Bearer\s+[^\s"'\\]+/gi, "Bearer [REDACTED]")
+		.replace(/(access_token|key|api_key|token)=([^&\s"'\\]+)/gi, "$1=[REDACTED]");
+}
+
 export function safeExportError(error) {
-	// FFmpeg/FFprobe error text may contain an authenticated command line.
-	return String(error?.message || error || "Export failed.")
-		.replace(/Bearer\s+[^\s'"\\]+/gi, "Bearer [REDACTED]")
-		.slice(0, 4000);
+	return redactSecrets(error?.message || error || "Export failed.").slice(0, 4000);
 }

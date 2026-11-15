@@ -4,8 +4,9 @@
   "main": "index.js",
 	"scripts": {
 		"test": "node --test test/*.test.js",
-    "start": "node --watch app.js"
-  },
+		"start": "node --max-old-space-size=200 app.js",
+		"dev": "node --watch app.js"
+	},
   "type": "module",
   "keywords": [],
   "author": "",
