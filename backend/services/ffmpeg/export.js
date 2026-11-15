@@ -5,6 +5,7 @@ import { buildCaptionFilter, buildFillFilter } from "./filters.js";
 import { probeDuration } from "./probe.js";
 import { getStreamCopyPlan } from "./stream-copy.js";
 import { createResourceMonitor } from "./resources.js";
+import { redactSecrets } from "../export/metrics.js";
 
 let activeFfmpegJobs = 0;
 
@@ -20,7 +21,9 @@ export async function normalizeVideoSection(inputPath, outputPath, duration, onR
 		.videoCodec("libx264")
 		.audioCodec("aac")
 		.outputOptions([
-			"-threads 1", // Keep the separate YouTube normalization policy unchanged.
+			"-threads 1", 
+			"-loglevel error",
+			"-stats",
 			"-map 0:v:0", "-map 0:a:0?", "-pix_fmt yuv420p",
 			"-preset ultrafast", "-crf 22", "-c:a aac", "-b:a 128k",
 			"-ar 48000", "-ac 2", "-start_at_zero",
@@ -39,8 +42,6 @@ export const QUALITY_PRESETS = {
 };
 
 function runCommand(command, outputPath, onProgress, onResources, sourceStreams) {
-	// fluent-ffmpeg automatically probes for progress, without input headers.
-	// Reuse the already authenticated source probe rather than issue that request.
 	if (sourceStreams) {
 		command.ffprobe = (...args) => {
 			const callback = args[args.length - 1];
@@ -54,12 +55,24 @@ function runCommand(command, outputPath, onProgress, onResources, sourceStreams)
 	let started = false;
 	let finished = false;
 	let concurrencyAtStart = 0;
+	let ffmpegArgs = "";
+	let ffmpegExitCode = null;
+
 	return new Promise((resolve, reject) => {
 		async function finish(error) {
 			if (finished) return;
 			finished = true;
 			if (started) activeFfmpegJobs -= 1;
 			try {
+				if (error) {
+					const rawMsg = String(error?.message || error || "");
+					const sanitizedMsg = redactSecrets(rawMsg);
+					const shortTail = sanitizedMsg.length > 2000 ? sanitizedMsg.slice(-2000) : sanitizedMsg;
+					error = Object.assign(
+						new Error(shortTail),
+						{ code: ffmpegExitCode ?? error?.code },
+					);
+				}
 				const resources = await monitor.stop();
 				await onResources?.({ ...resources, concurrentFfmpegJobsAtStart: concurrencyAtStart });
 				if (error) reject(error);
@@ -69,15 +82,39 @@ function runCommand(command, outputPath, onProgress, onResources, sourceStreams)
 			}
 		}
 		command
-			.on("start", () => {
+			.on("start", (cmdLine) => {
 				started = true;
 				activeFfmpegJobs += 1;
 				concurrencyAtStart = activeFfmpegJobs;
-				monitor.attach(command.ffmpegProc);
-				monitor.start();
+				ffmpegArgs = redactSecrets(cmdLine);
+				console.log(JSON.stringify({
+					event: "ffmpeg_spawned",
+					command: ffmpegArgs,
+				}));
+				if (command.ffmpegProc) {
+					command.ffmpegProc.on("exit", (code, signal) => {
+						ffmpegExitCode = code !== null ? code : (signal ? -1 : 0);
+					});
+					monitor.attach(command.ffmpegProc);
+					monitor.start();
+				}
 			})
-			.on("end", () => { void finish(); })
-			.on("error", (error) => { void finish(error); });
+			.on("end", () => {
+				console.log(JSON.stringify({
+					event: "ffmpeg_finished",
+					exitCode: ffmpegExitCode ?? 0,
+				}));
+				void finish();
+			})
+			.on("error", (error) => {
+				const sanitizedTail = redactSecrets(error?.message || error || "");
+				console.log(JSON.stringify({
+					event: "ffmpeg_failed",
+					exitCode: ffmpegExitCode ?? 1,
+					errorTail: sanitizedTail.slice(-200),
+				}));
+				void finish(error);
+			});
 		if (onProgress) command.on("progress", (progress) => {
 			Promise.resolve().then(() => onProgress(Math.min(100, progress.percent || 0)))
 				.catch(() => {});
@@ -98,6 +135,8 @@ function encodedAudioOptions(quality) {
 
 function commonOutputOptions() {
 	return [
+		"-loglevel error",
+		"-stats",
 		"-movflags +faststart",
 		"-avoid_negative_ts make_zero",
 		"-max_muxing_queue_size 1024",
@@ -148,8 +187,7 @@ export async function exportClip(options) {
 			...commonOutputOptions(),
 		];
 		const command = ffmpeg(sourcePath)
-			.inputOptions(inputOptions)
-			.setStartTime(start)
+			.inputOptions(["-ss", String(start), ...inputOptions])
 			.setDuration(duration)
 			.outputOptions(outputOptions)
 			.output(outputPath);
@@ -205,8 +243,7 @@ export async function exportClip(options) {
 	}
 
 	command
-		.inputOptions([...inputOptions, "-accurate_seek"])
-		.setStartTime(start)
+		.inputOptions(["-ss", String(start), "-threads 1", ...inputOptions])
 		.setDuration(duration)
 		.outputOptions([
 			"-map 0:a:0?",
@@ -214,6 +251,9 @@ export async function exportClip(options) {
 			`-crf ${q.crf}`,
 			`-preset ${q.preset}`,
 			"-pix_fmt yuv420p",
+			"-threads 1",
+			"-filter_threads 1",
+			"-x264-params rc-lookahead=0:threads=1",
 			...encodedAudioOptions(q),
 			"-start_at_zero",
 			...commonOutputOptions(),
