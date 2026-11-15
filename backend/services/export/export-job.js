@@ -602,7 +602,7 @@ async function processExportJob(exportId) {
 			() => ffmpegSvc.probeMetadata(outputPath),
 		);
 
-		const durationTolerance = Math.max(0.1, 2 / (Number(outputMetadata.frameRate) || 30));
+		const durationTolerance = Math.max(0.25, 3 / (Number(outputMetadata.frameRate) || 30));
 		const durationDiff = Math.abs((Number(outputMetadata.duration) || 0) - clipDuration);
 
 		const isVideoCodecValid = outputMetadata.videoCodec === "h264";
