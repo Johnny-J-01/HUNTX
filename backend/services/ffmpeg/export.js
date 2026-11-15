@@ -5,6 +5,7 @@ import { buildCaptionFilter, buildFillFilter } from "./filters.js";
 import { probeDuration } from "./probe.js";
 import { getStreamCopyPlan } from "./stream-copy.js";
 import { createResourceMonitor } from "./resources.js";
+import { redactSecrets } from "../export/metrics.js";
 
 let activeFfmpegJobs = 0;
 
@@ -22,6 +23,7 @@ export async function normalizeVideoSection(inputPath, outputPath, duration, onR
 		.outputOptions([
 			"-threads 1", // Keep the separate YouTube normalization policy unchanged.
 			"-loglevel error",
+			"-stats",
 			"-map 0:v:0", "-map 0:a:0?", "-pix_fmt yuv420p",
 			"-preset ultrafast", "-crf 22", "-c:a aac", "-b:a 128k",
 			"-ar 48000", "-ac 2", "-start_at_zero",
@@ -35,12 +37,11 @@ export async function normalizeVideoSection(inputPath, outputPath, duration, onR
 export const QUALITY_PRESETS = {
 	low: { crf: 28, preset: "ultrafast", audioBitrate: "128k" },
 	medium: { crf: 25, preset: "ultrafast", audioBitrate: "128k" },
-	// Changed from "superfast" to "veryfast" for high and maximum quality presets.
-	// veryfast uses less internal x264 lookahead buffer memory than superfast while
-	// still producing good quality. ultrafast (used by low/medium) already uses the
-	// least memory and is left untouched.
-	high: { crf: 22, preset: "veryfast", audioBitrate: "160k" },
-	maximum: { crf: 20, preset: "veryfast", audioBitrate: "192k" },
+	// High and maximum quality presets use superfast for fast encode times on constrained servers.
+	// Memory usage is bounded separately by single-threaded execution (-threads 1, -filter_threads 1)
+	// and disabling x264 lookahead (-x264-params rc-lookahead=0:threads=1).
+	high: { crf: 22, preset: "superfast", audioBitrate: "160k" },
+	maximum: { crf: 20, preset: "superfast", audioBitrate: "192k" },
 };
 
 function runCommand(command, outputPath, onProgress, onResources, sourceStreams) {
@@ -72,7 +73,7 @@ function runCommand(command, outputPath, onProgress, onResources, sourceStreams)
 				// buffering large strings in Node memory, and sanitize any credentials.
 				if (error) {
 					const rawMsg = String(error?.message || error || "");
-					const sanitizedMsg = rawMsg.replace(/Bearer\s+[^\s'"\\]+/gi, "Bearer [REDACTED]");
+					const sanitizedMsg = redactSecrets(rawMsg);
 					const shortTail = sanitizedMsg.length > 2000 ? sanitizedMsg.slice(-2000) : sanitizedMsg;
 					error = Object.assign(
 						new Error(shortTail),
@@ -92,8 +93,8 @@ function runCommand(command, outputPath, onProgress, onResources, sourceStreams)
 				started = true;
 				activeFfmpegJobs += 1;
 				concurrencyAtStart = activeFfmpegJobs;
-				// Redact any Bearer tokens or secrets from the logged arguments
-				ffmpegArgs = String(cmdLine || "").replace(/Bearer\s+[^\s'"\\]+/gi, "Bearer [REDACTED]");
+				// Redact any tokens, keys, or authorization headers from the logged arguments
+				ffmpegArgs = redactSecrets(cmdLine);
 				console.log(JSON.stringify({
 					event: "ffmpeg_spawned",
 					command: ffmpegArgs,
@@ -114,10 +115,11 @@ function runCommand(command, outputPath, onProgress, onResources, sourceStreams)
 				void finish();
 			})
 			.on("error", (error) => {
+				const sanitizedTail = redactSecrets(error?.message || error || "");
 				console.log(JSON.stringify({
 					event: "ffmpeg_failed",
 					exitCode: ffmpegExitCode ?? 1,
-					errorTail: String(error?.message || "").slice(-200),
+					errorTail: sanitizedTail.slice(-200),
 				}));
 				void finish(error);
 			});
@@ -141,8 +143,10 @@ function encodedAudioOptions(quality) {
 
 function commonOutputOptions() {
 	return [
-		// Quiet log level: suppress informational stderr output to minimize Node buffer usage.
+		// Quiet log level with stats: suppress informational stderr output to minimize
+		// Node buffer usage, but retain progress stats so fluent-ffmpeg progress events can fire.
 		"-loglevel error",
+		"-stats",
 		"-movflags +faststart",
 		"-avoid_negative_ts make_zero",
 		"-max_muxing_queue_size 1024",
@@ -192,10 +196,9 @@ export async function exportClip(options) {
 			...(copyPlan.copyAudio ? ["-c:a copy"] : encodedAudioOptions(q)),
 			...commonOutputOptions(),
 		];
-		// Pre-input seek: placing -ss BEFORE -i makes ffmpeg jump to the keyframe
-		// nearest to `start` without reading and decoding all preceding frames.
-		// For stream-copy this is especially important because there is no decode
-		// step to absorb the cost. The output duration is still controlled by
+		// Pre-input seek: fluent-ffmpeg's setStartTime(start) already placed -ss before -i.
+		// We kept the explicit inputOptions(["-ss", String(start), ...inputOptions]) to ensure
+		// it is explicitly positioned before the input. Output duration is still controlled by
 		// setDuration(-t) so the clip length is correct.
 		const command = ffmpeg(sourcePath)
 			.inputOptions(["-ss", String(start), ...inputOptions])
@@ -254,13 +257,12 @@ export async function exportClip(options) {
 	}
 
 	command
-		// Pre-input seek: -ss placed BEFORE -i tells ffmpeg to seek to the nearest
-		// keyframe before `start` without decoding preceding frames. This saves both
-		// time and memory compared to post-input (accurate) seek for long files.
-		// The output duration is still controlled by setDuration(-t duration), so
-		// the clip length remains correct. We remove -accurate_seek because it is
-		// only meaningful when -ss appears after the input.
-		.inputOptions(["-ss", String(start), ...inputOptions])
+		// Pre-input seek and decoder thread limiting:
+		// fluent-ffmpeg's setStartTime(start) already placed -ss before -i. We kept the explicit
+		// inputOption ["-ss", String(start)] to ensure it remains positioned before -i.
+		// We add "-threads 1" as an input option for re-encodes to limit decoder threads as well.
+		// Redundant -accurate_seek was removed since pre-input seeking is keyframe-accurate.
+		.inputOptions(["-ss", String(start), "-threads 1", ...inputOptions])
 		.setDuration(duration)
 		.outputOptions([
 			"-map 0:a:0?",

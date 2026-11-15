@@ -49,6 +49,12 @@ export function getExportJobStats() {
 	};
 }
 
+function isPathInsideDir(childPath, parentDir) {
+	if (!childPath || !parentDir) return false;
+	const relative = path.relative(parentDir, childPath);
+	return !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
 function sanitizeFilename(filename) {
 	return (
 		String(filename || "clip")
@@ -219,18 +225,19 @@ async function processExportJob(exportId) {
 	const processingLock = getExportProcessingLockKey(exportId);
 	if (isFileLocked(getExportDeleteLockKey(exportId))) return;
 	acquireFileLock(processingLock);
+	const workDir = getExportWorkDir(exportId);
 	let outputPath = null;
 	let captionsSrtPath = null;
 	let temporaryVideoPath = null;
 	let normalizedVideoPath = null;
 	let fallbackSourcePath = null;
+	let encodingDecision = null;
 	let metrics = null;
 	let lockedSourcePath = null;
 	let progressWrite = Promise.resolve();
 	let renderingComplete = false;
 
 	try {
-		const workDir = getExportWorkDir(exportId);
 		const exp = await store.getExport(exportId);
 
 		if (!exp) {
@@ -278,7 +285,7 @@ async function processExportJob(exportId) {
 		let inputOptions = [];
 		let streams = null;
 		let sourceAccess = "local";
-		let encodingDecision = null;
+		encodingDecision = null;
 		let exportStart = exp.start;
 		let exportEnd = exp.end;
 		const probeSource = (source, options = []) => metrics.measure(
@@ -441,47 +448,40 @@ async function processExportJob(exportId) {
 			throw new Error("The source video dimensions could not be determined.");
 		}
 
-		// --- Step 4: 720p scale cap for re-encoded clips ---
-		// If the source is taller than 720 pixels we scale the re-encoded clip
-		// down to a maximum of 720 pixels in height while keeping the original
-		// aspect ratio. This saves a lot of encoding memory and time because x264
-		// allocates frame buffers proportional to width × height.
-		//
-		// Rules:
-		//  • Stream-copy (cropMode=original, H.264 source): no scaling, -c copy is
-		//    used and that path never touches pixel data.
-		//  • Re-encode with user-chosen dimensions: the user's dimensions are
-		//    respected UNLESS they exceed 720 px in height; then we cap to 720.
-		//  • We only scale DOWN, never up.
-		//
-		// Note: `exportWidth`/`exportHeight` are the values ffmpeg will target.
-		// We may reduce them here; the filename is then built with the capped size
-		// so the user can see the actual output dimensions.
-		const MAX_ENCODE_HEIGHT = 720;
-		const sourceH = Number(sourceVideoStream.height) || 0;
-		// Stream-copy does not re-encode, so scaling has no effect there.
-		// We detect "will likely stream-copy" by checking cropMode=original here;
-		// the actual decision is made inside exportClip. If stream-copy is chosen
-		// the width/height we pass in are ignored, so it is safe to pass the
-		// (possibly capped) values regardless.
+		// --- Step 4: 720p scale cap based on export size (shorter side) ---
+		// If the shorter side of the export dimensions is above 720, scale both sides
+		// down preserving the aspect ratio and keeping both dimensions even (required for yuv420p).
+		// This applies to re-encoded clips regardless of source resolution (preventing upscaling
+		// beyond 720p on constrained servers).
+		// Example: a 1080x1920 reel has shorter side 1080 (>720). It scales to 720x1280 (not 406x720).
+		// A 1920x1080 landscape video has shorter side 1080 (>720). It scales to 1280x720.
+		// Stream-copy (cropMode=original with compatible H.264 source) does not re-encode, so
+		// scaling is bypassed.
 		const willLikelyReencode = exp.cropMode !== "original" || !(
 			sourceVideoStream.codec_name === "h264" &&
 			sourceVideoStream.pix_fmt === "yuv420p"
 		);
 		let scaledWidth = exportWidth;
 		let scaledHeight = exportHeight;
-		if (willLikelyReencode && sourceH > MAX_ENCODE_HEIGHT && exportHeight > MAX_ENCODE_HEIGHT) {
-			// Cap height to 720 and derive width from the original aspect ratio,
-			// then round up to an even number (yuv420p requires even dimensions).
-			scaledHeight = MAX_ENCODE_HEIGHT;
-			scaledWidth = Math.round((exportWidth / exportHeight) * MAX_ENCODE_HEIGHT);
+
+		const MAX_SHORTER_SIDE = 720;
+		const shorterSide = Math.min(exportWidth, exportHeight);
+
+		if (willLikelyReencode && shorterSide > MAX_SHORTER_SIDE) {
+			const scaleFactor = MAX_SHORTER_SIDE / shorterSide;
+			scaledWidth = Math.round(exportWidth * scaleFactor);
+			scaledHeight = Math.round(exportHeight * scaleFactor);
+
+			// Ensure both dimensions are even (required for H.264 yuv420p)
 			if (scaledWidth % 2 !== 0) scaledWidth += 1;
+			if (scaledHeight % 2 !== 0) scaledHeight += 1;
+
 			console.log(JSON.stringify({
 				event: "export_scale_cap",
 				exportId,
 				originalW: exportWidth, originalH: exportHeight,
 				scaledW: scaledWidth, scaledH: scaledHeight,
-				sourceH, reason: "source_exceeds_720p",
+				reason: "shorter_side_exceeds_720p",
 			}));
 		}
 
@@ -675,9 +675,9 @@ async function processExportJob(exportId) {
 
 		void uploadExportToDrive(exportId, video);
 
-		deleteFile(temporaryVideoPath);
-		deleteFile(normalizedVideoPath);
-		deleteFile(fallbackSourcePath);
+		if (temporaryVideoPath && isPathInsideDir(temporaryVideoPath, workDir)) deleteFile(temporaryVideoPath);
+		if (normalizedVideoPath && isPathInsideDir(normalizedVideoPath, workDir)) deleteFile(normalizedVideoPath);
+		if (fallbackSourcePath && isPathInsideDir(fallbackSourcePath, workDir)) deleteFile(fallbackSourcePath);
 
 		console.log(JSON.stringify({ event: "export_local_ready", exportId, metrics: measuredMetrics }));
 	} catch (error) {
@@ -715,15 +715,44 @@ async function processExportJob(exportId) {
 		}
 	} finally {
 		// Clean up files created or downloaded strictly for this export job.
-		// These paths are located inside this export's isolated workDir, so deleting
-		// them will never touch other exports or videos.
-		deleteFile(temporaryVideoPath);
-		deleteFile(normalizedVideoPath);
-		deleteFile(fallbackSourcePath);
-		if (lockedSourcePath) releaseFileLock(lockedSourcePath);
-		releaseFileLock(processingLock);
-		const exp = await store.getExport(exportId).catch(() => null);
-		if (exp && ["ERROR", "EXPIRED", "CLOSED"].includes(exp.status)) deleteExportWorkDir(exportId);
+		// Only delete files if they reside inside this export's isolated workDir;
+		// if fallbackSourcePath is not in workDir (e.g. in storage/uploads), do not delete it.
+		// Each delete is wrapped so a failure can never stop releaseFileLock from running.
+		const safeDeleteInWorkDir = (filePath) => {
+			if (!filePath) return;
+			try {
+				if (isPathInsideDir(filePath, workDir)) {
+					deleteFile(filePath);
+				}
+			} catch (deleteError) {
+				console.warn(`Failed to clean up temporary file ${filePath}:`, safeExportError(deleteError));
+			}
+		};
+
+		safeDeleteInWorkDir(temporaryVideoPath);
+		safeDeleteInWorkDir(normalizedVideoPath);
+		safeDeleteInWorkDir(fallbackSourcePath);
+
+		try {
+			if (lockedSourcePath) releaseFileLock(lockedSourcePath);
+		} catch (lockError) {
+			console.warn(`Failed to release source file lock for ${exportId}:`, safeExportError(lockError));
+		}
+
+		try {
+			releaseFileLock(processingLock);
+		} catch (lockError) {
+			console.warn(`Failed to release processing lock for ${exportId}:`, safeExportError(lockError));
+		}
+
+		try {
+			const exp = await store.getExport(exportId).catch(() => null);
+			if (exp && ["ERROR", "EXPIRED", "CLOSED"].includes(exp.status)) {
+				deleteExportWorkDir(exportId);
+			}
+		} catch (cleanupError) {
+			console.warn(`Failed to clean up workdir for ${exportId}:`, safeExportError(cleanupError));
+		}
 	}
 }
 
