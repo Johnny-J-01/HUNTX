@@ -45,7 +45,7 @@ export default function SignUp() {
 		}
 
 		if (data?.session) {
-			window.location.href = "/";
+			window.location.href = "/studio";
 			return;
 		}
 
@@ -187,7 +187,7 @@ export default function SignUp() {
 						<button
 							type="button"
 							onClick={() => {
-								window.location.href = "/";
+								window.location.href = "/studio";
 							}}
 							className="text-sm text-cf-muted hover:text-cf-text"
 						>
