@@ -28,7 +28,7 @@ export default function SignIn() {
 			return;
 		}
 
-		window.location.href = "/";
+		window.location.href = "/studio";
 	};
 
 	return (
@@ -138,7 +138,7 @@ export default function SignIn() {
 						<button
 							type="button"
 							onClick={() => {
-								window.location.href = "/";
+								window.location.href = "/studio";
 							}}
 							className="text-sm text-cf-muted hover:text-cf-text"
 						>

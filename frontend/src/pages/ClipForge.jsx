@@ -154,10 +154,7 @@ export default function ClipForge() {
 					if (expiredSelected) {
 						setTimeout(() => {
 							selectVideo(null);
-							showToast(
-								VIDEO_EXPIRED_MESSAGE,
-								"error",
-							);
+							showToast(VIDEO_EXPIRED_MESSAGE, "error");
 						}, 0);
 					}
 					return validVideos;
@@ -193,7 +190,9 @@ export default function ClipForge() {
 			} catch (error) {
 				if (cancelled || error.code !== "VIDEO_EXPIRED") return;
 
-				setVideos((current) => current.filter((item) => item.id !== selectedId));
+				setVideos((current) =>
+					current.filter((item) => item.id !== selectedId),
+				);
 				setSelectedId(null);
 				setVideo(null);
 				setTranscript([]);
@@ -509,12 +508,18 @@ export default function ClipForge() {
 
 	async function handleUpload(file, onProgress) {
 		try {
-			const { videoId } = await api.uploadVideo(file, file.name, onProgress);
+			const { videoId } = await api.uploadVideo(
+				file,
+				file.name,
+				onProgress,
+			);
 			const list = await api.listVideos();
 			const validList = unexpiredVideos(list);
 			const uploadedVideo = validList.find((item) => item.id === videoId);
 			const retentionLabel =
-				uploadedVideo?.ownerType === "authenticated" ? "1 day" : "1 hour";
+				uploadedVideo?.ownerType === "authenticated"
+					? "1 day"
+					: "1 hour";
 
 			setVideos(validList);
 			selectVideo(videoId);
@@ -553,10 +558,7 @@ export default function ClipForge() {
 							: "Max videos limit reached, Please delete the uploaded videos to add more"
 						: error.message;
 
-			showToast(
-				message,
-				"error",
-			);
+			showToast(message, "error");
 
 			const displayError = new Error(message);
 			displayError.code = error.code;
@@ -739,7 +741,10 @@ export default function ClipForge() {
 							<div className="flex-1 min-h-0 overflow-y-auto p-5 flex flex-col gap-4">
 								<div className="flex items-center justify-between">
 									<div className="flex items-center gap-3 min-w-0">
-										<button className="text-cf-muted hover:text-cf-text">
+										<button
+											className="text-cf-muted hover:text-cf-text"
+											onClick={() => selectVideo(null)}
+										>
 											←
 										</button>
 

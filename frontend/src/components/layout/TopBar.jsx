@@ -22,13 +22,13 @@ export default function TopBar({ onSearch, onMood, activeMood, disabled }) {
 				{/* DESKTOP / TABLET */}
 				<div className="hidden sm:grid sm:grid-cols-[1fr_auto_1fr] sm:items-start sm:gap-4">
 					{/* LOGO */}
-					<div className="flex items-center gap-2 shrink-0 pt-1">
+					<a
+						href="/"
+						className="flex items-center gap-2 shrink-0 pt-1"
+					>
 						<img
 							className="w-10 h-10 rounded-cf flex items-center justify-center text-base"
-							style={{
-								filter: "drop-shadow(0 0 12px rgba(250, 204, 21, 1)) drop-shadow(0 0 4px rgba(255, 255, 255, 0.9))",
-							}}
-							src="/VidHntr_logo.svg"
+							src="/VHntr_Logo.png"
 							alt="VidHntr Logo"
 						/>
 						<span className="font-custom font-black text-[16px] tracking-widest bg-gradient-to-r from-white via-white to-[#facc15] bg-clip-text text-transparent drop-shadow-[0_0_12px_rgba(250,204,21,0.6)]">
@@ -38,7 +38,7 @@ export default function TopBar({ onSearch, onMood, activeMood, disabled }) {
 							</span>
 							ntr
 						</span>
-					</div>
+					</a>
 
 					{/* SEARCH + MOODS */}
 					<div className="flex flex-col items-center w-[380px] lg:w-[520px] max-w-full">
@@ -61,7 +61,7 @@ export default function TopBar({ onSearch, onMood, activeMood, disabled }) {
 							<button
 								type="button"
 								onClick={handleSignOut}
-								className="cf-btn-ghost h-8 px-3 text-xs font-medium"
+								className="cf-btn-primary h-8 px-3 text-xs"
 							>
 								Logout
 							</button>
@@ -96,7 +96,7 @@ export default function TopBar({ onSearch, onMood, activeMood, disabled }) {
 					{/* TOP ROW */}
 					<div className="flex items-center justify-between gap-3">
 						{/* LOGO */}
-						<div className="flex items-center gap-2 min-w-0">
+						<a href="/" className="flex items-center gap-2 min-w-0">
 							<img
 								className="w-8 h-8 rounded-cf flex items-center justify-center shrink-0"
 								src="/VidHntr_logo.svg"
@@ -106,7 +106,7 @@ export default function TopBar({ onSearch, onMood, activeMood, disabled }) {
 							<span className="font-semibold text-[15px] tracking-tight">
 								VidHntr
 							</span>
-						</div>
+						</a>
 
 						{/* AUTH */}
 						<div className="flex items-center gap-2 shrink-0">
@@ -114,7 +114,7 @@ export default function TopBar({ onSearch, onMood, activeMood, disabled }) {
 								<button
 									type="button"
 									onClick={handleSignOut}
-									className="cf-btn-ghost h-8 px-3 text-xs font-medium"
+									className="cf-btn-primary h-8 px-3 text-xs"
 								>
 									Logout
 								</button>
