@@ -5,7 +5,7 @@ export default {
     extend: {
       colors: {
         cf: {
-          bg: '#0A0A0A',
+          bg: '#070708',
           panel: '#121212',
           panel2: '#161616',
           border: '#242424',
